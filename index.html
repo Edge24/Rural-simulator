@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rural-simulator</title>
+    <link rel="icon" href="Untitled.png" type="image/x-icon">   
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        
+        #crosshair {
+            position: absolute; top: 50%; left: 50%;
+            width: 8px; height: 8px;
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 10;
+            box-shadow: 0 0 4px rgba(0,0,0,0.5);
+        }
+
+        #blocker {
+            position: absolute; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.8);
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center;
+            color: white; z-index: 20;
+        }
+        #instructions { text-align: center; cursor: pointer; }
+        h1 { font-size: 50px; margin-bottom: 20px; color: #ffcb74; }
+        p { font-size: 20px; line-height: 1.5; color: #ddd; }
+        .key { background: #444; margin-right: 10px; padding: 2px 6px; border-radius: 4px; font-weight: bold; border: 1px solid #777; color: #fff; }
+        #canvas-container { width: 100%; height: 100%; display: block; }
+    </style>
+</head>
+<body>
+
+    <div id="crosshair"></div>
+
+    <div id="blocker">
+        <div id="instructions">
+            <h1>CLICK TO START</h1>
+            <p>Move: <span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span><br/></p>
+            <p>Sprint: <span class="key">SHIFT</span><br/></p>
+            <p>Look: Mouse<br/></p>
+            <p>(Press ESC to show cursor)</p>
+            <p style="color: aqua; font-family:cursive; font-size: 26px;">Created by Aritra Bera</p>
+        </div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { Sky } from 'three/addons/objects/Sky.js';
+
+        // --- CONFIGURATION ---
+        const WORLD_SIZE = 1000;
+        const TREE_COUNT = 800; 
+        const PLAYER_HEIGHT = 1.7; 
+
+        const STATIONS = [
+            { z: -300, name: "MAJHERGRAM" },
+            { z: 0,    name: "AKAIPUR" },
+            { z: 300,  name: "GANGNAPUR" }
+        ];
+
+        // Village locations
+        const VILLAGES = [
+            { z: -300, x: -60, r: 80 }, 
+            { z: 0,    x: -60, r: 80 }  
+        ];
+
+        const FARM_ZONES = [
+            [-120, -150, 100, 180],
+            [100, -150, 80, 150],
+            [-100, 150, 120, 150],
+            [130, 180, 90, 180]
+        ];
+
+        // --- SCENE ---
+        const scene = new THREE.Scene();
+        const fogColor = 0xcadbe8; 
+        scene.fog = new THREE.FogExp2(fogColor, 0.005); 
+
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.6; 
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        // --- SKY ---
+        const sky = new Sky();
+        sky.scale.setScalar(450000);
+        scene.add(sky);
+        const sunPosition = new THREE.Vector3();
+        const skyUniforms = sky.material.uniforms;
+        skyUniforms['turbidity'].value = 10;
+        skyUniforms['rayleigh'].value = 2; 
+        skyUniforms['mieCoefficient'].value = 0.005;
+        skyUniforms['mieDirectionalG'].value = 0.7;
+        const elevation = 15; 
+        const azimuth = 180;
+        const phi = THREE.MathUtils.degToRad(90 - elevation);
+        const theta = THREE.MathUtils.degToRad(azimuth);
+        sunPosition.setFromSphericalCoords(1, phi, theta);
+        skyUniforms['sunPosition'].value.copy(sunPosition);
+
+        // --- LIGHTING ---
+        const sunLight = new THREE.DirectionalLight(0xffffff, 2.2); 
+        sunLight.position.copy(sunPosition);
+        sunLight.position.multiplyScalar(100); 
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 4096;
+        sunLight.shadow.mapSize.height = 4096;
+        sunLight.shadow.camera.near = 0.5;
+        sunLight.shadow.camera.far = 500;
+        const d = 150; 
+        sunLight.shadow.camera.left = -d;
+        sunLight.shadow.camera.right = d;
+        sunLight.shadow.camera.top = d;
+        sunLight.shadow.camera.bottom = -d;
+        sunLight.shadow.bias = -0.0005;
+        scene.add(sunLight);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4); 
+        scene.add(ambientLight);
+
+        // --- RAILWAY MATHS ---
+        function getRailPath(z) { return Math.sin(z * 0.005) * 60 + Math.sin(z * 0.02) * 10; }
+        function getRailRotation(z) {
+            const delta = 0.1; const x1 = getRailPath(z); const x2 = getRailPath(z + delta);
+            return Math.atan2(x2 - x1, delta);
+        }
+
+        // --- TERRAIN ---
+        function getTerrainHeight(x, z) {
+            return Math.sin(x/45) * Math.cos(z/45) * 2.0 + Math.sin(x/15) * 0.3;
+        }
+
+        const groundGeo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, 128, 128); 
+        const posAttr = groundGeo.attributes.position;
+        for (let i = 0; i < posAttr.count; i++) {
+            const x = posAttr.getX(i);
+            const y = posAttr.getY(i); 
+            const h = getTerrainHeight(x, y);
+            posAttr.setZ(i, h);
+        }
+        groundGeo.computeVertexNormals();
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x3a4f26, roughness: 1, metalness: 0 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- ROADS ---
+        // 1. Procedural Dirt Texture
+        function createRoadTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#7a5e42'; ctx.fillRect(0,0,256,256);
+            const imgData = ctx.getImageData(0,0,256,256);
+            for(let i=0; i<imgData.data.length; i+=4){
+                const noise = (Math.random()-0.5)*30;
+                imgData.data[i] = Math.max(0, Math.min(255, imgData.data[i]+noise));
+                imgData.data[i+1] = Math.max(0, Math.min(255, imgData.data[i+1]+noise));
+                imgData.data[i+2] = Math.max(0, Math.min(255, imgData.data[i+2]+noise));
+            }
+            ctx.putImageData(imgData, 0, 0);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.wrapS = THREE.RepeatWrapping; tex.wrapT = THREE.RepeatWrapping;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            return tex;
+        }
+        const roadTexture = createRoadTexture();
+        const roadMat = new THREE.MeshStandardMaterial({ map: roadTexture, roughness: 0.9, color: 0xaaaaaa });
+
+        // 2. Ribbon Road Generator (conforms to terrain)
+        function createRibbonRoad(pathPoints, width) {
+            const curve = new THREE.CatmullRomCurve3(pathPoints);
+            const segments = pathPoints.length * 15;
+            const geometry = new THREE.BufferGeometry();
+            const vertices = []; const uvs = []; const indices = [];
+            const up = new THREE.Vector3(0, 1, 0);
+            let totalLen = 0;
+
+            for (let i = 0; i <= segments; i++) {
+                const t = i / segments;
+                const point = curve.getPoint(t);
+                const tangent = curve.getTangent(t);
+                const right = tangent.cross(up).normalize().multiplyScalar(width / 2);
+                const left = right.clone().negate();
+                
+                const vLeft = point.clone().add(left);
+                const vRight = point.clone().add(right);
+                // Snap to terrain height + slight offset
+                vLeft.y = getTerrainHeight(vLeft.x, vLeft.z) + 0.04;
+                vRight.y = getTerrainHeight(vRight.x, vRight.z) + 0.04;
+
+                vertices.push(vLeft.x, vLeft.y, vLeft.z, vRight.x, vRight.y, vRight.z);
+                
+                if(i > 0) totalLen += point.distanceTo(curve.getPoint((i-1)/segments));
+                uvs.push(0, totalLen / 5, 1, totalLen / 5); // Repeat texture every 5 units
+
+                if (i < segments) {
+                    const base = i * 2;
+                    indices.push(base, base + 1, base + 2);
+                    indices.push(base + 1, base + 3, base + 2);
+                }
+            }
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            geometry.setIndex(indices);
+            geometry.computeVertexNormals();
+            const mesh = new THREE.Mesh(geometry, roadMat);
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+        }
+
+        // 3. Define and Create Roads
+        // Main road running parallel to tracks near villages
+        const mainRoadPoints = [
+            new THREE.Vector3(-80, 0, -450),
+            new THREE.Vector3(-90, 0, -300),
+            new THREE.Vector3(-85, 0, -150),
+            new THREE.Vector3(-95, 0, 0),
+            new THREE.Vector3(-90, 0, 150),
+            new THREE.Vector3(-100, 0, 300),
+            new THREE.Vector3(-90, 0, 450)
+        ];
+        createRibbonRoad(mainRoadPoints, 7);
+
+        // Connector roads to villages
+        VILLAGES.forEach((v, i) => {
+            const startPoint = mainRoadPoints.find(p => Math.abs(p.z - v.z) < 100);
+            if(startPoint) {
+                const connectorPoints = [
+                    startPoint.clone(),
+                    new THREE.Vector3(v.x - 20, 0, v.z + (i%2==0 ? 20 : -20)),
+                    new THREE.Vector3(v.x, 0, v.z)
+                ];
+                createRibbonRoad(connectorPoints, 5);
+            }
+        });
+
+
+        // --- FARM LOGIC ---
+        function isInFarmZone(x, z) {
+            for(let zone of FARM_ZONES) {
+                const [cx, cz, width, depth] = zone;
+                if (x > cx - width/2 && x < cx + width/2 && z > cz - depth/2 && z < cz + depth/2) return true;
+            }
+            return false;
+        }
+        function createFarms() {
+            const soilMat = new THREE.MeshStandardMaterial({ color: 0x4d3e2e, roughness: 1.0 }); 
+            const sugarMat = new THREE.MeshStandardMaterial({ color: 0x556b2f, roughness: 0.8 }); 
+            const wheatMat = new THREE.MeshStandardMaterial({ color: 0x8c8c44, roughness: 0.8 }); 
+
+            const sugarGeo = new THREE.CylinderGeometry(0.05, 0.08, 2.5, 5); sugarGeo.translate(0, 1.25, 0); 
+            const wheatGeo = new THREE.BoxGeometry(0.4, 0.6, 0.4); wheatGeo.translate(0, 0.3, 0);
+
+            const sugarMesh = new THREE.InstancedMesh(sugarGeo, sugarMat, 20000);
+            const wheatMesh = new THREE.InstancedMesh(wheatGeo, wheatMat, 30000);
+            sugarMesh.castShadow = true; sugarMesh.receiveShadow = true;
+            wheatMesh.castShadow = true; wheatMesh.receiveShadow = true;
+
+            let sc = 0, wc = 0;
+            const dummy = new THREE.Object3D();
+
+            FARM_ZONES.forEach((zone, index) => {
+                const [cx, cz, width, depth] = zone;
+                const soilGeo = new THREE.PlaneGeometry(width, depth, 16, 16);
+                const sPos = soilGeo.attributes.position;
+                for(let i=0; i<sPos.count; i++){
+                    const h = getTerrainHeight(sPos.getX(i)+cx, sPos.getY(i)+cz);
+                    sPos.setZ(i, h + 0.05); 
+                }
+                soilGeo.computeVertexNormals();
+                const soil = new THREE.Mesh(soilGeo, soilMat);
+                soil.rotation.x = -Math.PI / 2;
+                soil.position.set(cx, 0, cz);
+                soil.receiveShadow = true;
+                scene.add(soil);
+
+                if(index % 2 === 0) {
+                    for(let x = -width/2 + 1; x < width/2 - 1; x += 1.5) {
+                        for(let z = -depth/2 + 1; z < depth/2 - 1; z += 0.4) {
+                            if(sc >= 20000) break;
+                            const wX = cx + x + (Math.random()-0.5)*0.2; 
+                            const wZ = cz + z + (Math.random()-0.5)*0.2;
+                            const h = getTerrainHeight(wX, wZ);
+                            dummy.position.set(wX, h, wZ);
+                            dummy.rotation.set((Math.random()-0.5)*0.2, Math.random()*Math.PI, (Math.random()-0.5)*0.2);
+                            dummy.scale.setScalar(0.8 + Math.random()*0.4);
+                            dummy.updateMatrix();
+                            sugarMesh.setMatrixAt(sc++, dummy.matrix);
+                        }
+                    }
+                } else {
+                    for(let x = -width/2 + 0.5; x < width/2 - 0.5; x += 0.5) {
+                        for(let z = -depth/2 + 0.5; z < depth/2 - 0.5; z += 0.5) {
+                            if(wc >= 30000) break;
+                            const wX = cx + x; const wZ = cz + z;
+                            const h = getTerrainHeight(wX, wZ);
+                            dummy.position.set(wX, h, wZ);
+                            dummy.rotation.y = Math.random() * Math.PI;
+                            dummy.scale.set(1+Math.random(), 0.8+Math.random()*0.4, 1+Math.random());
+                            dummy.updateMatrix();
+                            wheatMesh.setMatrixAt(wc++, dummy.matrix);
+                        }
+                    }
+                }
+            });
+            sugarMesh.count = sc; wheatMesh.count = wc;
+            scene.add(sugarMesh); scene.add(wheatMesh);
+        }
+        createFarms();
+
+        // --- VILLAGE LOGIC (MIXED HOUSING) ---
+        const houseColors = [
+            0xcccccc, // Cement Grey
+            0xeae0c8, // Cream
+            0xcce0ea, // Pale Blue
+            0xdddddd, // Whiteish
+            0xd3a17e  // Faded Brick
+        ];
+
+        // 1. Concrete House Logic
+        function createConcreteHouse(x, z, rotationY) {
+            const houseGroup = new THREE.Group();
+            const groundH = getTerrainHeight(x, z);
+            houseGroup.position.set(x, groundH, z);
+            houseGroup.rotation.y = rotationY;
+
+            // Base Dimensions
+            const width = 4.5 + Math.random();
+            const depth = 5.0 + Math.random();
+            const floorHeight = 3.2;
+
+            const c = houseColors[Math.floor(Math.random()*houseColors.length)];
+            const wallMat = new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 });
+            const detailMat = new THREE.MeshStandardMaterial({ color: 0x333333 }); 
+
+            // Ground Floor
+            const gf = new THREE.Mesh(new THREE.BoxGeometry(width, floorHeight, depth), wallMat);
+            gf.position.y = floorHeight/2;
+            gf.castShadow = true; gf.receiveShadow = true;
+            houseGroup.add(gf);
+
+            // First Floor
+            const ffWidth = width * (0.9 + Math.random()*0.1);
+            const ffDepth = depth * (0.9 + Math.random()*0.1);
+            const ff = new THREE.Mesh(new THREE.BoxGeometry(ffWidth, floorHeight, ffDepth), wallMat);
+            ff.position.y = floorHeight + (floorHeight/2);
+            ff.castShadow = true; ff.receiveShadow = true;
+            houseGroup.add(ff);
+
+            // Roof Slab
+            const roof = new THREE.Mesh(new THREE.BoxGeometry(ffWidth+0.4, 0.2, ffDepth+0.4), new THREE.MeshStandardMaterial({ color: 0x555555 }));
+            roof.position.y = (floorHeight * 2) + 0.1;
+            houseGroup.add(roof);
+
+            // Water Tank
+            const tank = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 0.8, 16), new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.3 }));
+            tank.position.set((Math.random()-0.5)*1, (floorHeight * 2) + 0.5, (Math.random()-0.5)*1);
+            tank.castShadow = true;
+            houseGroup.add(tank);
+
+            // Door
+            const door = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 2.2), new THREE.MeshStandardMaterial({ color: 0x4a3c31 }));
+            door.position.set(0, 1.1, depth/2 + 0.05);
+            houseGroup.add(door);
+
+            // Windows
+            const winGeo = new THREE.PlaneGeometry(0.8, 1.0);
+            const w1 = new THREE.Mesh(winGeo, detailMat); w1.position.set(-1.2, floorHeight + 1.5, ffDepth/2 + 0.05); houseGroup.add(w1);
+            const w2 = new THREE.Mesh(winGeo, detailMat); w2.position.set(1.2, floorHeight + 1.5, ffDepth/2 + 0.05); houseGroup.add(w2);
+
+            scene.add(houseGroup);
+            return { x: x, z: z, radius: 4.5 }; // Collision radius
+        }
+
+        // 2. Hut Logic
+        function createHut(x, z, rotationY) {
+            const hutGroup = new THREE.Group();
+            const groundH = getTerrainHeight(x, z);
+            hutGroup.position.set(x, groundH, z);
+            hutGroup.rotation.y = rotationY;
+
+            const wallH = 2.5; const wallW = 4.0; const wallD = 3.5; const plinthH = 0.4; const roofH = 2.0;
+            const wallMat = new THREE.MeshStandardMaterial({ color: 0xa07040, roughness: 1.0 }); 
+
+            // Plinth
+            const plinth = new THREE.Mesh(new THREE.BoxGeometry(wallW + 0.3, plinthH, wallD + 0.3), wallMat);
+            plinth.position.y = plinthH / 2; hutGroup.add(plinth);
+
+            // Walls
+            const walls = new THREE.Mesh(new THREE.BoxGeometry(wallW, wallH, wallD), wallMat);
+            walls.position.y = plinthH + (wallH / 2); walls.castShadow = true; walls.receiveShadow = true; hutGroup.add(walls);
+
+            // Thatched Roof
+            const roofMat = new THREE.MeshStandardMaterial({ color: 0x8f7d5c, roughness: 1.0 }); 
+            const roofGeo = new THREE.ConeGeometry(wallW * 0.8, roofH, 4); 
+            const roof = new THREE.Mesh(roofGeo, roofMat);
+            roof.position.y = plinthH + wallH + (roofH / 2) - 0.2; roof.rotation.y = Math.PI / 4; roof.castShadow = true; hutGroup.add(roof);
+
+            // Door
+            const door = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 1.8), new THREE.MeshStandardMaterial({ color: 0x111111 }));
+            door.position.set(0, plinthH + 0.9, (wallD / 2) + 0.05); hutGroup.add(door);
+
+            scene.add(hutGroup);
+            return { x: x, z: z, radius: 3.0 }; // Smaller radius for huts
+        }
+
+        function createVillages() {
+            const RAIL_SAFETY_DISTANCE = 25; 
+            const existingHouses = [];
+
+            VILLAGES.forEach(v => {
+                const count = 25 + Math.floor(Math.random() * 8); 
+                let placed = 0;
+                let attempts = 0;
+
+                while (placed < count && attempts < 300) {
+                    attempts++;
+                    const angle = Math.random() * Math.PI * 2;
+                    const dist = Math.sqrt(Math.random()) * (v.r); 
+                    const hx = v.x + Math.cos(angle) * dist;
+                    const hz = v.z + Math.sin(angle) * dist;
+
+                    // --- CHECK TRACK DISTANCE ---
+                    const trackX = getRailPath(hz);
+                    if (Math.abs(hx - trackX) < RAIL_SAFETY_DISTANCE) continue;
+
+                    // --- CHECK CONGESTION/OVERLAP ---
+                    let tooClose = false;
+                    for (let existing of existingHouses) {
+                        const dx = existing.x - hx;
+                        const dz = existing.z - hz;
+                        // Use average radius for collision check
+                        if (dx*dx + dz*dz < (existing.radius + 3.0)**2) { 
+                            tooClose = true;
+                            break;
+                        }
+                    }
+                    if(tooClose) continue;
+
+                    // Place House (Mix of Huts and Concrete)
+                    const rot = Math.random() * Math.PI * 2;
+                    let houseData;
+                    // 30% Huts, 70% Concrete
+                    if (Math.random() < 0.3) {
+                        houseData = createHut(hx, hz, rot);
+                    } else {
+                        houseData = createConcreteHouse(hx, hz, rot);
+                    }
+                    
+                    existingHouses.push(houseData);
+                    placed++;
+                }
+            });
+        }
+        createVillages();
+
+
+        // --- RAILWAY CONSTRUCTION ---
+        function createRailway() {
+            const spacing = 1.2; const segments = Math.floor(WORLD_SIZE / spacing);
+            const trackWidth = 2.8;
+            const sleeperGeo = new THREE.BoxGeometry(trackWidth, 0.2, 0.6);
+            const railGeo = new THREE.BoxGeometry(0.15, 0.25, spacing + 0.1); 
+            const sleeperMat = new THREE.MeshStandardMaterial({ color: 0x3d3024, roughness: 1.0 }); 
+            const railMat = new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.6, roughness: 0.5 }); 
+            const sleeperMesh = new THREE.InstancedMesh(sleeperGeo, sleeperMat, segments);
+            const railLMesh = new THREE.InstancedMesh(railGeo, railMat, segments);
+            const railRMesh = new THREE.InstancedMesh(railGeo, railMat, segments);
+            sleeperMesh.castShadow = true; sleeperMesh.receiveShadow = true;
+            railLMesh.castShadow = true; railLMesh.receiveShadow = true;
+            railRMesh.castShadow = true; railRMesh.receiveShadow = true;
+            const dummy = new THREE.Object3D();
+            for (let i = 0; i < segments; i++) {
+                const z = (i * spacing) - (WORLD_SIZE / 2);
+                const actualX = getRailPath(z); const rotY = getRailRotation(z); const h = getTerrainHeight(actualX, z);
+                dummy.position.set(actualX, h + 0.1, z); dummy.rotation.set(0, rotY, 0); dummy.updateMatrix(); sleeperMesh.setMatrixAt(i, dummy.matrix);
+                const rOffset = 0.9;
+                dummy.position.set(actualX + Math.cos(rotY) * -rOffset, h + 0.3, z - Math.sin(rotY) * -rOffset); dummy.rotation.set(0, rotY, 0); dummy.updateMatrix(); railLMesh.setMatrixAt(i, dummy.matrix);
+                dummy.position.set(actualX + Math.cos(rotY) * rOffset, h + 0.3, z - Math.sin(rotY) * rOffset); dummy.rotation.set(0, rotY, 0); dummy.updateMatrix(); railRMesh.setMatrixAt(i, dummy.matrix);
+            }
+            scene.add(sleeperMesh); scene.add(railLMesh); scene.add(railRMesh);
+        }
+        createRailway();
+
+        // --- STATIONS ---
+        function createTextTexture(text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024; canvas.height = 256; const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ffea00'; ctx.fillRect(0, 0, 1024, 256);
+            ctx.lineWidth = 20; ctx.strokeStyle = '#000000'; ctx.strokeRect(0, 0, 1024, 256);
+            ctx.font = 'bold 120px Arial'; ctx.fillStyle = '#000000'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(text, 512, 128);
+            const texture = new THREE.CanvasTexture(canvas); texture.anisotropy = renderer.capabilities.getMaxAnisotropy(); return texture;
+        }
+        function placeObjectOnTerrain(obj, centerZ, offsetX, offsetZ) {
+            const trackX = getRailPath(centerZ + offsetZ); const trackRot = getRailRotation(centerZ + offsetZ);
+            const worldX = trackX + Math.cos(trackRot) * offsetX; const worldZ = centerZ + offsetZ - Math.sin(trackRot) * offsetX;
+            const groundY = getTerrainHeight(worldX, worldZ);
+            obj.position.set(worldX, groundY, worldZ); obj.rotation.y = trackRot; 
+        }
+        function createStation(config) {
+            const zPos = config.z; const name = config.name;
+            const fenceMat = new THREE.MeshStandardMaterial({ color: 0x999999, roughness: 0.9 }); 
+            const brickMat = new THREE.MeshStandardMaterial({ color: 0x6e4020, roughness: 1.0 }); 
+            const darkMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+            const nameMat = new THREE.MeshStandardMaterial({ map: createTextTexture(name), roughness: 0.6 });
+            const length = 40; const rightOffset = 5.5; 
+            const postGeo = new THREE.BoxGeometry(0.2, 1.2, 0.2); postGeo.translate(0, 0.6, 0); 
+            const railGeo = new THREE.BoxGeometry(0.1, 0.1, 2.2); 
+            const postCount = 20; const step = length / postCount;
+            for(let i = 0; i <= postCount; i++) {
+                const zOffset = -(length/2) + (i * step);
+                const post = new THREE.Mesh(postGeo, fenceMat);
+                placeObjectOnTerrain(post, zPos, rightOffset, zOffset); post.castShadow = true; scene.add(post);
+                if(i < postCount) {
+                     const rail = new THREE.Mesh(railGeo, fenceMat); const midZOffset = zOffset + (step/2);
+                     const trackX = getRailPath(zPos + midZOffset); const trackRot = getRailRotation(zPos + midZOffset);
+                     const wX = trackX + Math.cos(trackRot) * rightOffset; const wZ = zPos + midZOffset - Math.sin(trackRot) * rightOffset;
+                     const gY = getTerrainHeight(wX, wZ);
+                     rail.position.set(wX, gY + 0.9, wZ); rail.rotation.y = trackRot; scene.add(rail);
+                }
+            }
+            const hutGroup = new THREE.Group();
+            const hut = new THREE.Mesh(new THREE.BoxGeometry(3, 3, 3), brickMat); hut.position.y = 1.5; hut.castShadow = true; hutGroup.add(hut);
+            const roof = new THREE.Mesh(new THREE.ConeGeometry(2.5, 1, 4), new THREE.MeshStandardMaterial({color: 0x2e241c})); roof.position.y = 3.5; roof.rotation.y = Math.PI/4; hutGroup.add(roof);
+            const win = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), darkMat); win.position.set(-1.51, 1.5, 0); win.rotation.y = -Math.PI/2; hutGroup.add(win);
+            const tBoard = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.4, 1.2), new THREE.MeshStandardMaterial({color:0xdddddd})); tBoard.position.set(-1.6, 2.3, 0); hutGroup.add(tBoard);
+            placeObjectOnTerrain(hutGroup, zPos, rightOffset + 1.5, 0); scene.add(hutGroup);
+            const signGroup = new THREE.Group();
+            const sPostGeo = new THREE.CylinderGeometry(0.12, 0.12, 3); sPostGeo.translate(0, 1.5, 0); 
+            const p1 = new THREE.Mesh(sPostGeo, darkMat); p1.position.set(0, 0, -1.8); const p2 = new THREE.Mesh(sPostGeo, darkMat); p2.position.set(0, 0, 1.8); signGroup.add(p1); signGroup.add(p2);
+            const board = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.3, 4.5), nameMat); board.position.set(0, 2.2, 0); board.rotation.y = Math.PI; signGroup.add(board);
+            const sign1 = signGroup.clone(); placeObjectOnTerrain(sign1, zPos, 4, -(length/2)); sign1.rotateY(Math.PI); scene.add(sign1);
+            const sign2 = signGroup.clone(); placeObjectOnTerrain(sign2, zPos, 4, (length/2)); sign2.rotateY(Math.PI); scene.add(sign2);
+        }
+        STATIONS.forEach(s => createStation(s));
+
+        // --- FLORA ---
+        const trees = [];
+        const trunkGeo = new THREE.CylinderGeometry(0.5, 0.7, 1, 6);
+        const leafGeo = new THREE.DodecahedronGeometry(1, 0);
+        function createTree(x, z) {
+            const h = getTerrainHeight(x, z);
+            const treeGroup = new THREE.Group(); treeGroup.position.set(x, h, z);
+            const type = Math.random();
+            let radius = 0.5;
+            if (type < 0.4) {
+                const trunkH = 2 + Math.random();
+                const t = new THREE.Mesh(trunkGeo, new THREE.MeshStandardMaterial({color: 0x3d2817})); t.position.y = trunkH/2; t.scale.set(1.2, trunkH, 1.2); t.castShadow = true; treeGroup.add(t);
+                const l = new THREE.Mesh(leafGeo, new THREE.MeshStandardMaterial({color: 0x1a3308})); l.position.y = trunkH + 1.2; l.scale.set(3.5, 3, 3.5); l.castShadow = true; treeGroup.add(l); radius = 1.2;
+            } else if (type < 0.7) {
+                const trunkH = 7 + Math.random() * 5;
+                const t = new THREE.Mesh(trunkGeo, new THREE.MeshStandardMaterial({color: 0x4a3b32})); t.position.y = trunkH/2; t.scale.set(0.7, trunkH, 0.7); t.castShadow = true; treeGroup.add(t);
+                const lMat = new THREE.MeshStandardMaterial({ color: 0x3d4f28 }); 
+                for(let k=0; k<5; k++){
+                    const blob = new THREE.Mesh(leafGeo, lMat); blob.position.y = trunkH - 0.5 + Math.random()*2; blob.position.x = (Math.random()-0.5)*3.5; blob.position.z = (Math.random()-0.5)*3.5; blob.castShadow = true; treeGroup.add(blob);
+                } radius = 0.6;
+            } else {
+                const b = new THREE.Mesh(leafGeo, new THREE.MeshStandardMaterial({color: 0x445522})); const s = 0.6 + Math.random(); b.scale.set(s, s*0.6, s); b.position.y = s*0.3; b.castShadow = true; treeGroup.add(b); radius = 0; 
+            }
+            treeGroup.rotation.y = Math.random() * Math.PI;
+            scene.add(treeGroup);
+            if(radius > 0) trees.push({ x: x, z: z, radius: radius });
+        }
+        for(let i=0; i<TREE_COUNT; i++) {
+            const x = (Math.random() - 0.5) * WORLD_SIZE; const z = (Math.random() - 0.5) * WORLD_SIZE;
+            if(Math.sqrt(x*x + z*z) < 20) continue; 
+            const trackCenterX = getRailPath(z);
+            if(Math.abs(x - trackCenterX) < 5) continue;
+            let nearStation = false;
+            for(let s of STATIONS) {
+                if(Math.abs(z - s.z) < 40) {
+                    const dx = x - trackCenterX;
+                    if(dx > -3 && dx < 12) { nearStation = true; break; }
+                }
+            }
+            if(nearStation) continue;
+            if(isInFarmZone(x, z)) continue;
+            createTree(x, z);
+        }
+
+        // --- CONTROLS & ANIMATION ---
+        const controls = new PointerLockControls(camera, document.body);
+        const blocker = document.getElementById('blocker'); const instructions = document.getElementById('instructions');
+        instructions.addEventListener('click', () => controls.lock());
+        controls.addEventListener('lock', () => blocker.style.display = 'none');
+        controls.addEventListener('unlock', () => blocker.style.display = 'flex');
+        scene.add(controls.getObject());
+
+        const moveState = { forward: false, backward: false, left: false, right: false, sprint: false };
+        const velocity = new THREE.Vector3(); const direction = new THREE.Vector3();
+        const onKeyDown = (e) => {
+            switch (e.code) {
+                case 'KeyW': moveState.forward = true; break; case 'KeyA': moveState.left = true; break;
+                case 'KeyS': moveState.backward = true; break; case 'KeyD': moveState.right = true; break; case 'ShiftLeft': moveState.sprint = true; break;
+            }
+        };
+        const onKeyUp = (e) => {
+            switch (e.code) {
+                case 'KeyW': moveState.forward = false; break; case 'KeyA': moveState.left = false; break;
+                case 'KeyS': moveState.backward = false; break; case 'KeyD': moveState.right = false; break; case 'ShiftLeft': moveState.sprint = false; break;
+            }
+        };
+        document.addEventListener('keydown', onKeyDown); document.addEventListener('keyup', onKeyUp);
+
+        const clock = new THREE.Clock();
+        function checkCollision(x, z) {
+            for(let t of trees) {
+                const dx = x - t.x; const dz = z - t.z;
+                if(dx*dx + dz*dz < (t.radius + 0.3)**2) return true;
+            } return false;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            if (controls.isLocked) {
+                const speed = moveState.sprint ? 16.0 : 7.0;
+                velocity.x -= velocity.x * 10.0 * delta; velocity.z -= velocity.z * 10.0 * delta;
+                direction.z = Number(moveState.forward) - Number(moveState.backward); direction.x = Number(moveState.right) - Number(moveState.left);
+                direction.normalize();
+                if (moveState.forward || moveState.backward) velocity.z -= direction.z * speed * 10.0 * delta;
+                if (moveState.left || moveState.right) velocity.x -= direction.x * speed * 10.0 * delta;
+                const prevPos = controls.getObject().position.clone();
+                controls.moveRight(-velocity.x * delta); controls.moveForward(-velocity.z * delta);
+                const currPos = controls.getObject().position;
+                if(checkCollision(currPos.x, currPos.z)) {
+                    controls.getObject().position.copy(prevPos); velocity.set(0,0,0);
+                } else {
+                    const h = getTerrainHeight(currPos.x, currPos.z);
+                    controls.getObject().position.y = h + PLAYER_HEIGHT;
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
